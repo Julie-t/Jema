@@ -926,8 +926,8 @@ class JemaEngine:
                 output += "\nEssential Ingredients\n\n"
                 for ing in recipe_data.get('ingredients', []):
                     ing = ing.strip()
-                    if not ing.startswith("*"):
-                        ing = "* " + ing
+                    # Remove any existing bullet formatting
+                    ing = ing.lstrip('* -').strip()
                     # Skip empty category lines
                     parts = ing.split(":", 1)
                     if len(parts) == 2 and not parts[1].strip():
@@ -951,8 +951,8 @@ class JemaEngine:
                 output += "\nTips for Perfect {}\n\n".format(recipe_name)
                 for tip in recipe_data['tips']:
                     tip = tip.strip()
-                    if not tip.startswith("*"):
-                        tip = "* " + tip
+                    # Remove any existing bullet formatting
+                    tip = tip.lstrip('* -').strip()
                     output += tip + "\n"
             
             message = output
@@ -978,8 +978,8 @@ class JemaEngine:
                 output += "\nEssential Ingredients\n\n"
                 for ing in rich_recipe.get('ingredients', []):
                     ing = ing.strip()
-                    if not ing.startswith("*"):
-                        ing = "* " + ing
+                    # Remove any existing bullet formatting
+                    ing = ing.lstrip('* -').strip()
                     # Skip empty category lines
                     parts = ing.split(":", 1)
                     if len(parts) == 2 and not parts[1].strip():
@@ -1002,8 +1002,8 @@ class JemaEngine:
                     output += f"\nTips for Perfect {recipe_name}\n\n"
                     for tip in rich_recipe['tips']:
                         tip = tip.strip()
-                        if not tip.startswith("*"):
-                            tip = "* " + tip
+                        # Remove any existing bullet formatting
+                        tip = tip.lstrip('* -').strip()
                         output += tip + "\n"
                 
                 message = output
