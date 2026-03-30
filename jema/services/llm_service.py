@@ -10,6 +10,197 @@ except ImportError:
     Groq = None
 from jema.utils.language_detector import LanguageDetector
 
+
+def _build_personalisation_block(user_profile: dict) -> str:
+    """
+    Builds a personalisation instruction block injected into
+    every Groq system prompt. Tells Groq exactly how to tailor
+    the recipe for this specific user.
+    Returns empty string if no meaningful profile data exists.
+    """
+    if not user_profile:
+        return ""
+
+    lines = [
+        "═" * 50,
+        "USER PROFILE — tailor this recipe to fit this user:",
+        "═" * 50,
+    ]
+
+    # Goal
+    goal = user_profile.get("goal")
+    if goal:
+        lines.append(f"Goal: {goal}")
+
+    # Calorie target
+    tdee = user_profile.get("tdee")
+    if tdee:
+        lines.append(
+            f"Daily calorie target: ~{tdee} kcal "
+            f"(adjust portions accordingly)"
+        )
+
+    # BMI
+    bmi_category = user_profile.get("bmi_category")
+    bmi = user_profile.get("bmi")
+    if bmi_category and bmi:
+        lines.append(f"BMI: {bmi} ({bmi_category})")
+
+    # Diet
+    diet = user_profile.get("diet")
+    if diet:
+        lines.append(f"Diet type: {diet}")
+
+    # Cooking skills — adjust recipe complexity
+    cooking_skills = user_profile.get("cooking_skills")
+    if cooking_skills:
+        skill_instructions = {
+            "novice": (
+                "Use simple techniques only. "
+                "Explain every step in plain language. "
+                "Avoid complex methods like braising or reduction."
+            ),
+            "basic": (
+                "Keep steps clear and straightforward. "
+                "Brief explanations are fine."
+            ),
+            "intermediate": (
+                "You can include moderate techniques. "
+                "Assume the user knows basic cooking terms."
+            ),
+            "advanced": (
+                "Full complexity is fine. "
+                "You may include advanced techniques and chef tips."
+            ),
+        }
+        instruction = skill_instructions.get(
+            cooking_skills.lower(), ""
+        )
+        if instruction:
+            lines.append(f"Cooking skill: {cooking_skills}. {instruction}")
+
+    # Eating reality
+    eating_realities = user_profile.get("eating_realities")
+    if eating_realities:
+        reality_map = {
+            "affordable": (
+                "Prioritise low-cost, accessible ingredients. "
+                "Suggest budget-friendly substitutes where possible."
+            ),
+            "fast": (
+                "Prioritise recipes under 30 minutes. "
+                "Suggest shortcuts where appropriate."
+            ),
+            "variety": (
+                "Feel free to suggest interesting variations "
+                "and creative serving ideas."
+            ),
+            "familiar": (
+                "Stick to traditional, well-known cooking methods. "
+                "Avoid unusual or unfamiliar ingredients."
+            ),
+        }
+        for reality_key, reality_instruction in reality_map.items():
+            if reality_key in eating_realities.lower():
+                lines.append(f"Eating reality: {reality_instruction}")
+                break
+
+    # Halal
+    if user_profile.get("is_halal"):
+        lines.append(
+            "STRICT HALAL: This recipe must be fully halal. "
+            "No pork, no alcohol, no lard, no wine in cooking. "
+            "Do not suggest any of these even as alternatives."
+        )
+
+    # Vegetarian
+    if user_profile.get("is_vegan"):
+        lines.append(
+            "STRICT VEGAN: No meat, no fish, no dairy, "
+            "no eggs, no honey, no animal products of any kind."
+        )
+    elif user_profile.get("is_vegetarian"):
+        if user_profile.get("is_pescatarian"):
+            lines.append(
+                "PESCATARIAN: No meat or poultry. "
+                "Fish and seafood are allowed."
+            )
+        else:
+            lines.append(
+                "VEGETARIAN: No meat, no poultry, no fish. "
+                "Eggs and dairy are allowed."
+            )
+
+    # Medical conditions
+    if user_profile.get("has_diabetes"):
+        lines.append(
+            "MEDICAL — DIABETES: Avoid high-GI ingredients "
+            "(white rice, white bread, refined sugar, honey). "
+            "Prefer high-fibre, low-GI alternatives. "
+            "Mention this in your tips section."
+        )
+
+    if user_profile.get("has_hypertension"):
+        lines.append(
+            "MEDICAL — HYPERTENSION: Minimise sodium. "
+            "Avoid salty sauces, stock cubes, and canned goods. "
+            "Suggest low-sodium alternatives in your tips section."
+        )
+
+    other_conditions = [
+        c for c in user_profile.get("medical_restrictions", [])
+        if c not in ("diabetes", "hypertension", "none",
+                     "no medical restrictions")
+    ]
+    if other_conditions:
+        lines.append(
+            f"Other medical conditions: {', '.join(other_conditions)}. "
+            f"Be mindful of these when suggesting ingredients."
+        )
+
+    # Allergies
+    allergies = [
+        a for a in user_profile.get("allergies", [])
+        if a not in ("no allergies", "none", "")
+    ]
+    if allergies:
+        lines.append(
+            f"ALLERGIES — strictly avoid: {', '.join(allergies)}. "
+            f"Do not suggest these even as optional ingredients."
+        )
+
+    # Dislikes
+    dislikes = [
+        d for d in user_profile.get("dislikes", [])
+        if d not in ("none", "no", "")
+    ]
+    if dislikes:
+        lines.append(
+            f"Dislikes — try to avoid: {', '.join(dislikes)}."
+        )
+
+    # Name personalisation
+    name = user_profile.get("name")
+    if name and name != "User":
+        lines.append(f"Address the user as {name}.")
+
+    lines.append("═" * 50)
+
+    # If only the header and footer lines were added, no real
+    # profile data exists — return empty to skip injection
+    if len(lines) <= 3:
+        return ""
+
+    lines.append(
+        "Always respect every restriction above. "
+        "Never suggest an ingredient that conflicts with the "
+        "user's allergies, religion, medical conditions, or diet. "
+        "Adjust tips and serving suggestions to match their goal."
+    )
+
+    return "\n".join(lines)
+
+
 class LLMService:
     """Service to interact with LLM and manage conversation context for Jema."""
 
@@ -559,8 +750,8 @@ RECIPE_END"""
         recipe_name: str,
         cuisine_region: str = "",
         language: str = "english",
-        csv_row=None,
         user_profile: dict = None,
+        csv_row=None,
     ) -> str:
         """
         Generate a fully formatted recipe using grounded source hierarchy.
@@ -793,8 +984,10 @@ Language: {language}
 
 Make it authentic, practical, and easy to follow. Use only real, chef-verified tips (no hallucinated tips). Include amounts for all ingredients."""
 
-        # Build and inject user personalisation into system prompt
+        # Build personalisation block from user profile
         personalisation = _build_personalisation_block(user_profile)
+
+        # Inject into system prompt
         if personalisation:
             system_prompt = system_prompt + f"\n\n{personalisation}"
 
@@ -1034,200 +1227,6 @@ Make it authentic, practical, and easy to follow. Use only real, chef-verified t
             "steps":          cleaned_steps[:6],
             "tips":           cleaned_tips,
         }
+        
 
 
-def _build_personalisation_block(user_profile: dict) -> str:
-    """
-    Builds a personalisation instruction block injected into
-    every Groq system prompt. Tells Groq exactly how to tailor
-    the recipe for this specific user based on their profile.
-    Returns empty string if no meaningful profile data exists
-    so the system prompt is not polluted with empty sections.
-    """
-    if not user_profile:
-        return ""
-
-    lines = [
-        "=" * 50,
-        "USER PROFILE — tailor this recipe to this user:",
-        "=" * 50,
-    ]
-
-    # ── GOAL ───────────────────────────────────────────────
-    goal = user_profile.get("goal")
-    if goal:
-        lines.append(f"Goal: {goal}")
-
-    # ── CALORIE TARGET ─────────────────────────────────────
-    tdee = user_profile.get("tdee")
-    if tdee:
-        lines.append(
-            f"Daily calorie target: ~{tdee} kcal. "
-            f"Adjust portions to fit this target."
-        )
-
-    # ── BMI ────────────────────────────────────────────────
-    bmi_category = user_profile.get("bmi_category")
-    bmi = user_profile.get("bmi")
-    if bmi_category and bmi:
-        lines.append(f"BMI: {bmi} ({bmi_category})")
-
-    # ── DIET ───────────────────────────────────────────────
-    diet = user_profile.get("diet")
-    if diet:
-        lines.append(f"Diet type: {diet}")
-
-    # ── COOKING SKILLS ─────────────────────────────────────
-    skill_map = {
-        "novice": (
-            "Use only simple techniques. Explain every step "
-            "in plain language. Avoid complex methods."
-        ),
-        "basic": (
-            "Keep steps clear. Brief explanations are fine."
-        ),
-        "intermediate": (
-            "Moderate techniques are fine. Assume user knows "
-            "basic cooking terms."
-        ),
-        "advanced": (
-            "Full complexity is fine. Include chef-level tips."
-        ),
-    }
-    cooking_skills = user_profile.get("cooking_skills", "")
-    skill_instruction = skill_map.get(
-        cooking_skills.lower() if cooking_skills else "", ""
-    )
-    if skill_instruction:
-        lines.append(
-            f"Cooking skill: {cooking_skills}. {skill_instruction}"
-        )
-
-    # ── EATING REALITY ─────────────────────────────────────
-    eating_realities = user_profile.get("eating_realities", "")
-    reality_map = {
-        "affordable": (
-            "Prioritise low-cost ingredients. "
-            "Suggest budget-friendly substitutes."
-        ),
-        "fast": (
-            "Prioritise recipes under 30 minutes. "
-            "Suggest shortcuts where appropriate."
-        ),
-        "variety": (
-            "Suggest interesting variations and "
-            "creative serving ideas."
-        ),
-        "familiar": (
-            "Stick to traditional methods. "
-            "Avoid unusual or unfamiliar ingredients."
-        ),
-    }
-    if eating_realities:
-        for key, instruction in reality_map.items():
-            if key in eating_realities.lower():
-                lines.append(f"Eating reality: {instruction}")
-                break
-
-    # ── RELIGION / HALAL ───────────────────────────────────
-    if user_profile.get("is_halal"):
-        lines.append(
-            "STRICT HALAL: Recipe must be fully halal. "
-            "No pork, no alcohol, no lard, no wine in cooking. "
-            "Do not suggest these even as alternatives."
-        )
-
-    # ── DIET RESTRICTIONS ──────────────────────────────────
-    if user_profile.get("is_vegan"):
-        lines.append(
-            "STRICT VEGAN: No meat, no fish, no dairy, "
-            "no eggs, no honey, no animal products of any kind."
-        )
-    elif user_profile.get("is_pescatarian"):
-        lines.append(
-            "PESCATARIAN: No meat or poultry. "
-            "Fish and seafood are allowed."
-        )
-    elif user_profile.get("is_vegetarian"):
-        lines.append(
-            "VEGETARIAN: No meat, no poultry, no fish. "
-            "Eggs and dairy are allowed."
-        )
-
-    if user_profile.get("is_low_carb"):
-        lines.append(
-            "LOW CARB/KETO: Minimise carbohydrates. "
-            "Avoid rice, bread, pasta, and starchy vegetables. "
-            "Prefer protein and healthy fats."
-        )
-
-    # ── MEDICAL CONDITIONS ─────────────────────────────────
-    if user_profile.get("has_diabetes"):
-        lines.append(
-            "MEDICAL — DIABETES: Avoid high-GI ingredients "
-            "(white rice, white bread, refined sugar, honey). "
-            "Prefer high-fibre, low-GI alternatives. "
-            "Include a diabetes-specific tip in your tips section."
-        )
-
-    if user_profile.get("has_hypertension"):
-        lines.append(
-            "MEDICAL — HYPERTENSION: Minimise sodium. "
-            "Avoid salty sauces, stock cubes, and canned goods. "
-            "Suggest low-sodium alternatives in your tips section."
-        )
-
-    other_conditions = [
-        c for c in user_profile.get("medical_restrictions", [])
-        if c not in (
-            "diabetes", "hypertension",
-            "none", "no medical restrictions"
-        )
-    ]
-    if other_conditions:
-        lines.append(
-            f"Other medical conditions: "
-            f"{', '.join(other_conditions)}. "
-            f"Be mindful when suggesting ingredients."
-        )
-
-    # ── ALLERGIES ──────────────────────────────────────────
-    allergies = [
-        a for a in user_profile.get("allergies", [])
-        if a not in ("no allergies", "none", "")
-    ]
-    if allergies:
-        lines.append(
-            f"ALLERGIES — strictly avoid: {', '.join(allergies)}. "
-            f"Do not suggest these even as optional ingredients."
-        )
-
-    # ── DISLIKES ───────────────────────────────────────────
-    dislikes = [
-        d for d in user_profile.get("dislikes", [])
-        if d not in ("none", "no", "")
-    ]
-    if dislikes:
-        lines.append(
-            f"Dislikes — try to avoid: {', '.join(dislikes)}."
-        )
-
-    # ── NAME ───────────────────────────────────────────────
-    name = user_profile.get("name")
-    if name and name != "User":
-        lines.append(f"Address the user as {name}.")
-
-    lines.append("=" * 50)
-
-    # If only header + footer lines, no real data was added
-    if len(lines) <= 3:
-        return ""
-
-    lines.append(
-        "Always respect every restriction above. "
-        "Never suggest an ingredient that conflicts with the "
-        "user's allergies, religion, medical conditions, or diet. "
-        "Adjust tips and serving suggestions to match their goal."
-    )
-
-    return "\n".join(lines)

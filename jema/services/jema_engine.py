@@ -247,7 +247,8 @@ class JemaEngine:
         self.recipe_confirmed: bool = False
         self.awaiting_recipe_choice: bool = False
         self.debug_mode: bool = debug_mode
-        
+        self.user_profile: Dict = {}  # Profile context for personalisation
+        self.suggested_regions: List[str] = []  # Track suggested regions for diversity
         # Regional diversity tracking (prevent repetition from same region)
         self.suggested_regions: List[str] = []  # Track regions of suggested recipes in this session
 
@@ -257,7 +258,7 @@ class JemaEngine:
         
         Args:
             user_input: User's natural language input
-            user_profile: Optional dict from profiles.jema_profile_service.get_user_profile_context()
+            user_profile: Optional user profile context for personalisation
         
         Returns:
             Dictionary with:
@@ -267,7 +268,8 @@ class JemaEngine:
                 - cta: str (call-to-action message)
                 - state: Dict (current conversation state for debugging)
         """
-        # Store on instance — accessible by all handler methods
+        # Store profile on the instance so all handlers can access it
+        # Falls back to empty dict so all profile.get() calls are safe
         self.user_profile = user_profile or {}
         
         user_input = user_input.strip()
@@ -467,135 +469,6 @@ class JemaEngine:
         
         return self._build_response(response, [])
 
-    def _apply_profile_filters(self, df):
-        """
-        Filters a recipe dataframe using the user's profile.
-        Called inside _handle_ingredient_based() after ingredient
-        matching, before the final cap of 3 suggestions.
-
-        Silently returns the original df if:
-        - No profile is set
-        - Profile has all defaults (no restrictions)
-
-        Never raises — if filtering fails for any reason,
-        returns the original unfiltered df.
-        """
-        if not self.user_profile:
-            return df
-
-        try:
-            p = self.user_profile
-
-            # ── HALAL ──────────────────────────────────────────────
-            if p.get("is_halal"):
-                HARAM = [
-                    "pork", "bacon", "ham", "lard",
-                    "wine", "beer", "alcohol", "rum"
-                ]
-                for item in HARAM:
-                    df = df[~df["core_ingredients"].str.contains(
-                        item, case=False, na=False
-                    )]
-
-            # ── VEGETARIAN ─────────────────────────────────────────
-            if p.get("is_vegetarian"):
-                MEATS = [
-                    "beef", "chicken", "pork", "lamb",
-                    "goat", "mutton", "meat"
-                ]
-                # Pescatarian keeps fish
-                if not p.get("is_pescatarian"):
-                    MEATS += [
-                        "fish", "shrimp", "prawn",
-                        "tuna", "tilapia", "salmon"
-                    ]
-                for item in MEATS:
-                    df = df[~df["core_ingredients"].str.contains(
-                        item, case=False, na=False
-                    )]
-
-            # ── VEGAN ──────────────────────────────────────────────
-            if p.get("is_vegan"):
-                ANIMAL = [
-                    "egg", "milk", "cream", "butter",
-                    "cheese", "yogurt", "honey", "ghee"
-                ]
-                for item in ANIMAL:
-                    df = df[~df["core_ingredients"].str.contains(
-                        item, case=False, na=False
-                    )]
-
-            # ── DIABETES ───────────────────────────────────────────
-            if p.get("has_diabetes"):
-                HIGH_GI = [
-                    "white rice", "white bread",
-                    "white flour", "sugar", "honey",
-                    "condensed milk"
-                ]
-                for item in HIGH_GI:
-                    df = df[~df["core_ingredients"].str.contains(
-                        item, case=False, na=False
-                    )]
-
-            # ── HYPERTENSION ───────────────────────────────────────
-            if p.get("has_hypertension"):
-                HIGH_SODIUM = [
-                    "salt fish", "salted fish",
-                    "soy sauce", "stock cube",
-                    "maggi", "bouillon"
-                ]
-                for item in HIGH_SODIUM:
-                    df = df[~df["core_ingredients"].str.contains(
-                        item, case=False, na=False
-                    )]
-
-            # ── ALLERGIES ──────────────────────────────────────────
-            ALLERGY_MAP = {
-                "gluten": [
-                    "wheat", "flour", "bread",
-                    "pasta", "barley"
-                ],
-                "dairy": [
-                    "milk", "cream", "butter",
-                    "cheese", "yogurt"
-                ],
-                "nut": [
-                    "peanut", "almond", "cashew",
-                    "walnut", "pecan"
-                ],
-                "shellfish": [
-                    "shrimp", "crab", "lobster",
-                    "prawn", "clam"
-                ],
-                "lactose": [
-                    "milk", "cream", "cheese", "yogurt"
-                ],
-            }
-            for allergy in p.get("allergies", []):
-                if allergy in ("no allergies", "none", ""):
-                    continue
-                keywords = ALLERGY_MAP.get(allergy, [allergy])
-                for keyword in keywords:
-                    df = df[~df["core_ingredients"].str.contains(
-                        keyword, case=False, na=False
-                    )]
-
-            # ── DISLIKES (soft exclude) ────────────────────────────
-            for dislike in p.get("dislikes", []):
-                if dislike and dislike not in ("none", "no", ""):
-                    df = df[~df["core_ingredients"].str.contains(
-                        dislike, case=False, na=False
-                    )]
-
-        except Exception as e:
-            # Never let filtering break the suggestion flow
-            logger.warning(
-                f"[JemaEngine] Profile filter failed: {e} "
-                f"— returning unfiltered results"
-            )
-
-        return df
-
     def _handle_recipe_selection(self, user_input: str) -> Optional[Dict]:
         """Handle user selecting from suggested recipes."""
         selected = None
@@ -766,7 +639,11 @@ class JemaEngine:
 
         # Generate full formatted recipe using Groq
         try:
-            message = self.llm.generate_recipe(recipe_name, cuisine_region="East Africa")
+            message = self.llm.generate_recipe(
+                recipe_name,
+                cuisine_region="East Africa",
+                user_profile=self.user_profile
+            )
             
             if message:
                 # Add closing statement and update history
@@ -930,13 +807,6 @@ class JemaEngine:
         strong_csv.sort(key=lambda x: x[0], reverse=True)
         csv_results = [recipe for _, recipe in strong_csv][:3]
 
-        # Apply profile-based filters (dietary restrictions, allergies, medical conditions)
-        # Convert to dataframe for filtering, then back to list
-        if csv_results:
-            csv_df = pd.DataFrame(csv_results)
-            csv_df = self._apply_profile_filters(csv_df)
-            csv_results = csv_df.to_dict('records')
-
         # Build seen names from CSV results
         seen_names = {
             self._normalize_recipe_name(r.get("meal_name", ""))
@@ -1038,6 +908,9 @@ class JemaEngine:
                 if region:
                     self.suggested_regions.append(region)
 
+        # Apply profile-based filters before storing
+        all_recipes = self._apply_profile_filters(all_recipes)
+
         # Store full recipes in session state
         self.last_suggested_recipes = all_recipes
         self.awaiting_recipe_choice = True
@@ -1069,6 +942,107 @@ class JemaEngine:
         self.llm.add_to_history("assistant", output)
 
         return self._build_response(output, all_recipes)
+
+    def _apply_profile_filters(self, recipes_list: List[Dict]) -> List[Dict]:
+        """
+        Filters a recipe list based on the user's profile.
+        Removes recipes that conflict with the user's religion,
+        diet, allergies, medical conditions, or dislikes.
+        Silently returns the original list if no profile is set.
+        """
+        if not self.user_profile:
+            return recipes_list
+
+        # Convert list of dicts to DataFrame for filtering
+        df = pd.DataFrame(recipes_list) if recipes_list else pd.DataFrame()
+        if df.empty:
+            return recipes_list
+
+        p = self.user_profile
+
+        # ── HALAL ────────────────────────────────────────────────
+        if p.get("is_halal"):
+            HARAM = [
+                "pork", "bacon", "ham", "lard", "wine",
+                "beer", "alcohol", "rum", "pork rinds"
+            ]
+            for item in HARAM:
+                df = df[~df["core_ingredients"].astype(str).str.contains(
+                    item, case=False, na=False
+                )]
+
+        # ── VEGETARIAN ───────────────────────────────────────────
+        if p.get("is_vegetarian"):
+            MEATS = [
+                "beef", "chicken", "pork", "lamb",
+                "goat", "mutton", "meat"
+            ]
+            # Pescatarian keeps fish and shrimp
+            if not p.get("is_pescatarian"):
+                MEATS += ["fish", "shrimp", "prawn", "tuna", "tilapia"]
+            for item in MEATS:
+                df = df[~df["core_ingredients"].astype(str).str.contains(
+                    item, case=False, na=False
+                )]
+
+        # ── VEGAN ────────────────────────────────────────────────
+        if p.get("is_vegan"):
+            ANIMAL_PRODUCTS = [
+                "egg", "milk", "cream", "butter",
+                "cheese", "yogurt", "honey", "ghee"
+            ]
+            for item in ANIMAL_PRODUCTS:
+                df = df[~df["core_ingredients"].astype(str).str.contains(
+                    item, case=False, na=False
+                )]
+
+        # ── DIABETES ─────────────────────────────────────────────
+        if p.get("has_diabetes"):
+            HIGH_GI = [
+                "white rice", "white bread", "white flour",
+                "sugar", "honey", "condensed milk"
+            ]
+            for item in HIGH_GI:
+                df = df[~df["core_ingredients"].astype(str).str.contains(
+                    item, case=False, na=False
+                )]
+
+        # ── HYPERTENSION ─────────────────────────────────────────
+        if p.get("has_hypertension"):
+            HIGH_SODIUM = [
+                "salt fish", "salted fish", "soy sauce",
+                "stock cube", "maggi", "bouillon"
+            ]
+            for item in HIGH_SODIUM:
+                df = df[~df["core_ingredients"].astype(str).str.contains(
+                    item, case=False, na=False
+                )]
+
+        # ── ALLERGIES ────────────────────────────────────────────
+        ALLERGY_MAP = {
+            "gluten": ["wheat", "flour", "bread", "pasta", "barley"],
+            "dairy": ["milk", "cream", "butter", "cheese", "yogurt"],
+            "nut": ["peanut", "almond", "cashew", "walnut", "pecan"],
+            "shellfish": ["shrimp", "crab", "lobster", "prawn", "clam"],
+            "lactose": ["milk", "cream", "cheese", "yogurt", "ice cream"],
+        }
+        for allergy in p.get("allergies", []):
+            if allergy in ("no allergies", "none", ""):
+                continue
+            keywords = ALLERGY_MAP.get(allergy, [allergy])
+            for keyword in keywords:
+                df = df[~df["core_ingredients"].astype(str).str.contains(
+                    keyword, case=False, na=False
+                )]
+
+        # ── DISLIKES (soft exclude) ───────────────────────────────
+        for dislike in p.get("dislikes", []):
+            if dislike and dislike not in ("none", "no"):
+                df = df[~df["core_ingredients"].astype(str).str.contains(
+                    dislike, case=False, na=False
+                )]
+
+        return df.to_dict("records")
 
     def _handle_no_matches(self, user_ingredients: set, matcher, user_constraints: Dict, user_input: str) -> Dict:
         """Handle when no recipes match user ingredients."""
@@ -1237,7 +1211,7 @@ class JemaEngine:
                 rich_recipe = self.llm.generate_recipe(
                     recipe_name,
                     country,
-                    user_profile=self.user_profile,
+                    user_profile=self.user_profile
                 )
                 if rich_recipe:
                     # generate_recipe() now returns a fully formatted string

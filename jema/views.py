@@ -16,13 +16,13 @@ from rest_framework.response import Response
 from jema.models import ChatSession, ChatMessage
 from jema.serializers import ChatSessionSerializer, ChatMessageSerializer
 from jema.services.jema_engine import JemaEngine
+from profiles.jema_profile_service import get_user_profile_context
 from jema.services.jema_modelling import (
     run_jema_model,
     answer_with_rag,
     answer_with_integrated_pipeline,
     recipes_features_df,
 )
-from profiles.jema_profile_service import get_user_profile_context
 
 logger = logging.getLogger(__name__)
 
@@ -121,10 +121,6 @@ def chat(request):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        # Fetch user profile for personalisation
-        # Returns safe defaults if user_id is None or profile missing
-        user_profile = get_user_profile_context(user_id)
-        
         # Get session-specific engine for state isolation
         if session_id:
             try:
@@ -136,6 +132,9 @@ def chat(request):
         else:
             # No session, use global engine
             engine = get_engine()
+        
+        # Get user profile context for personalisation
+        user_profile = get_user_profile_context(request.user) if request.user.is_authenticated else {}
         
         # Process message
         response = engine.process_message(user_message, user_profile=user_profile)
