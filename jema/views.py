@@ -22,6 +22,7 @@ from jema.services.jema_modelling import (
     answer_with_integrated_pipeline,
     recipes_features_df,
 )
+from profiles.jema_profile_service import get_user_profile_context
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +121,10 @@ def chat(request):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
+        # Fetch user profile for personalisation
+        # Returns safe defaults if user_id is None or profile missing
+        user_profile = get_user_profile_context(user_id)
+        
         # Get session-specific engine for state isolation
         if session_id:
             try:
@@ -133,7 +138,7 @@ def chat(request):
             engine = get_engine()
         
         # Process message
-        response = engine.process_message(user_message)
+        response = engine.process_message(user_message, user_profile=user_profile)
         
         # Optionally persist to database
         if session_id:
