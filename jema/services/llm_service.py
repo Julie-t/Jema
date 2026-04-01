@@ -3,6 +3,7 @@ import re
 import json
 import time
 import difflib
+import logging
 from pathlib import Path
 from typing import List, Dict, Optional
 try:
@@ -10,6 +11,8 @@ try:
 except ImportError:
     Groq = None
 from jema.utils.language_detector import LanguageDetector
+
+logger = logging.getLogger(__name__)
 
 
 def split_steps_paragraph(paragraph: str) -> list:
@@ -95,6 +98,56 @@ Style: short, simple, friendly, to the point. Plain text only.
         except Exception as e:
             print(f"Warning: Failed to initialize Groq: {e}")
             self.client = None
+
+    def _build_personalisation_block(self, user_profile: dict) -> str:
+        if not user_profile:
+            return ""
+        
+        instructions = []
+        
+        # Safe field access with .get() and or "" to avoid None.lower() errors
+        name = user_profile.get("name", "") or ""
+        goal = user_profile.get("goal", "") or ""
+        religion = (user_profile.get("religion", "") or "").lower().strip()
+        diet = (user_profile.get("diet", "") or "").lower().strip()
+        cooking_skills = (user_profile.get("cooking_skills", "") or "").lower().strip()
+        income_level = (user_profile.get("income_level", "") or "").lower().strip()
+        eating_realities = (user_profile.get("eating_realities", "") or "").lower().strip()
+        medical_restrictions = user_profile.get("medical_restrictions", "") or ""
+        allergies = user_profile.get("allergies", "") or ""
+        dislikes = user_profile.get("dislikes", "") or ""
+        tdee = user_profile.get("tdee")
+        bmi = user_profile.get("bmi")
+        bmi_category = (user_profile.get("bmi_category", "") or "").lower().strip()
+        
+        # Personalisation rules for each field
+        if religion == "muslim":
+            instructions.append("STRICT HALAL: No pork, no bacon, no ham, no lard, no alcohol, no wine, no beer anywhere in the recipe. Do not suggest these even as optional alternatives.")
+        
+        if diet == "vegan":
+            instructions.append("STRICT VEGAN: No meat, no fish, no dairy, no eggs, no honey, no animal products of any kind.")
+        elif diet == "vegetarian":
+            instructions.append("VEGETARIAN: No meat, no poultry, no fish. Eggs and dairy are allowed.")
+        
+        if "diabetes" in medical_restrictions.lower():
+            instructions.append("MEDICAL — DIABETES: Strictly avoid high-GI ingredients (white rice, white bread, refined sugar, honey, condensed milk). Prefer high-fibre, low-GI alternatives. Include a diabetes-specific tip in the tips section.")
+        
+        if "hypertension" in medical_restrictions.lower():
+            instructions.append("MEDICAL — HYPERTENSION: Minimise sodium. Avoid stock cubes, Maggi, soy sauce, canned goods. Suggest low-sodium alternatives in the tips section.")
+        
+        if allergies:
+            allergies_clean = [a.strip() for a in allergies.split(',') if a.strip()]
+            if allergies_clean:
+                allergy_list = ", ".join(allergies_clean)
+                instructions.append(f"ALLERGIES: Strictly avoid in all ingredients and substitutions: {allergy_list}. Never suggest these even as optional extras.")
+        
+        if cooking_skills == "novice":
+            instructions.append("COOKING SKILL: Use only simple techniques. Explain every step in plain everyday language. Avoid terms like braise, deglaze, or reduce.")
+        
+        if income_level == "low":
+            instructions.append("INCOME: Strongly prefer cheap, accessible ingredients. Avoid expensive or imported items.")
+        
+        return "\n".join(instructions)
 
     def _wait_for_rate_limit(self):
         """Rate limiting helper to respect API limits."""
@@ -728,55 +781,15 @@ ABSOLUTE RULES — no exceptions:
 9. Skip ingredient categories that have no value, no amount, or "none" — do not write "none", do not write the label.
 10. Step titles must be descriptive actions: "Measure Flour", "Knead Dough", "Heat Pan" — never "Step 1" or generic labels."""
 
-        # Helper function to build personalization instruction from user profile
-        def build_personalization_instruction(user_profile: dict) -> str:
-            """Build personalization rules based on user's dietary preferences from onboarding."""
-            if not user_profile:
-                return ""
-            
-            instructions = []
-            
-            # Allergies
-            allergies = user_profile.get('allergies', '').strip()
-            if allergies:
-                allergies_list = [a.strip() for a in allergies.split(',') if a.strip()]
-                instructions.append(f"ALLERGIES: User cannot eat: {', '.join(allergies_list)}. Do NOT include these ingredients. If they are in the base recipe, suggest appropriate substitutes.")
-            
-            # Medical restrictions
-            restrictions = user_profile.get('medical_restrictions', '').strip()
-            if restrictions:
-                instructions.append(f"MEDICAL RESTRICTIONS: {restrictions}. Adapt the recipe accordingly.")
-            
-            # Dislikes
-            dislikes = user_profile.get('dislikes', '').strip()
-            if dislikes:
-                dislikes_list = [d.strip() for d in dislikes.split(',') if d.strip()]
-                instructions.append(f"DISLIKES: User dislikes: {', '.join(dislikes_list)}. Try to avoid or suggest alternatives.")
-            
-            # Diet type (vegan, vegetarian, etc.)
-            diet = user_profile.get('diet', '').strip()
-            if diet and diet.lower() not in ('none', 'no preference', 'omnivore'):
-                diet_lower = diet.lower()
-                if 'vegan' in diet_lower:
-                    instructions.append("USER DIET: Vegan. Replace all animal products with plant-based alternatives.")
-                elif 'vegetarian' in diet_lower:
-                    instructions.append("USER DIET: Vegetarian. Remove or replace meat/fish with vegetarian alternatives.")
-                elif 'halal' in diet_lower:
-                    instructions.append("USER DIET: Halal. Use only halal-certified ingredients and preparation methods.")
-                else:
-                    instructions.append(f"USER DIET: {diet}. Adapt recipe accordingly.")
-            
-            # Cooking skill level (can affect complexity of instructions)
-            cooking_skills = user_profile.get('cooking_skills', '').strip()
-            if cooking_skills and cooking_skills.lower() not in ('none', 'intermediate'):
-                if cooking_skills.lower() == 'beginner':
-                    instructions.append("COOKING SKILL: Beginner. Use simple, clear instructions. Avoid advanced techniques.")
-                elif cooking_skills.lower() == 'advanced':
-                    instructions.append("COOKING SKILL: Advanced cook. You can assume familiarity with advanced techniques.")
-            
-            return "\n".join(instructions)
+        # Inject personalisation block from user_profile if available
+        try:
+            personalisation = self._build_personalisation_block(user_profile)
+        except Exception as e:
+            logger.error(f"Personalisation block failed: {e}")
+            personalisation = ""
         
-        personalization = build_personalization_instruction(user_profile)
+        if personalisation:
+            system_prompt = system_prompt + f"\n\n{personalisation}"
 
         # --- BUILD SOURCE-SPECIFIC USER PROMPTS ---
         if source == "CSV":
@@ -785,14 +798,9 @@ ABSOLUTE RULES — no exceptions:
             if variant_modifier:
                 variant_instruction = f"\n\nIMPORTANT: The user has requested the {variant_modifier.upper()} version of this recipe. Replace the primary protein with {variant_modifier} throughout the ingredients and steps. Adjust cooking times and methods appropriately for {variant_modifier}. Do not use the original meat protein."
             
-            # Build personalization instruction
-            personalization_section = ""
-            if personalization:
-                personalization_section = f"\n\nPERSONALIZATION RULES:\n{personalization}"
-            
             user_prompt = f"""You are formatting a recipe from the Jema CSV database into a specific structure.
 The ingredients and steps below are the ONLY source of truth. Do not add, remove, or change any content.
-Do not generate your own recipe. Do not guess. Use only what is provided below.{variant_instruction}{personalization_section}
+Do not generate your own recipe. Do not guess. Use only what is provided below.{variant_instruction}
 
 CRITICAL: Do not use any markdown formatting anywhere in your response. Do not wrap step titles in double asterisks like **Title**. Write step titles in plain text followed by a colon only. Correct: "1. Prepare the Dough: Mix flour and water." Wrong: "1. **Prepare the Dough**: Mix flour and water." This rule applies to every single step without exception.
 
@@ -970,10 +978,16 @@ FORMAT RULES:
             return result
 
         except Exception as e:
-            print(f"[generate_recipe] Groq call failed: {e}")
-            import traceback
-            traceback.print_exc()
-            return ""
+            error_msg = str(e)
+            logger.error(f"Groq call failed: {e}")
+
+            if "rate_limit" in error_msg.lower() or "429" in error_msg:
+                return "I'm temporarily at capacity. Please try again in a moment."
+
+            if "authentication" in error_msg.lower() or "401" in error_msg:
+                return "I'm having a configuration issue. Please contact support."
+
+            return "I wasn't able to generate that recipe right now. Please try again."
     
     def _get_compound_intro(self, recipe_name: str, compound_recipe: dict) -> str:
         """

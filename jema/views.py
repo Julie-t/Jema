@@ -6,6 +6,7 @@ HTTP API endpoints for the Jema cooking assistant.
 import json
 import logging
 
+from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 from rest_framework import status
@@ -69,12 +70,6 @@ def get_engine():
     return _engine
 
 def get_session_engine(session_id: int, user=None):
-    \"\"\"Get or create a per-session engine instance for state isolation.
-    
-    Args:
-        session_id: The chat session ID
-        user: Optional Django User object for personalization
-    \"\"\"
     if session_id not in _session_engines:
         try:
             _session_engines[session_id] = JemaEngine(user=user)
@@ -88,26 +83,6 @@ def get_session_engine(session_id: int, user=None):
 @permission_classes([AllowAny])
 @csrf_exempt
 def chat(request):
-    """
-    POST /api/jema/chat/
-    
-    Send a message to Jema and get a response.
-    
-    Request body:
-    {
-        "message": "I have rice and beans",
-        "session_id": 123 (optional, for DB persistence)
-    }
-    
-    Response:
-    {
-        "message": "Here are recipes you can make...",
-        "recipes": [...],
-        "language": "english",
-        "cta": "",
-        "state": {...}
-    }
-    """
     try:
         # Parse request
         if isinstance(request.data, dict):
@@ -136,6 +111,16 @@ def chat(request):
                 logger.debug(f"Could not fetch user {user_id}: {e}")
                 user = None
         
+        # Fetch user profile context for personalization
+        user_profile = None
+        try:
+            if user and user.is_authenticated:
+                from profiles.services import get_user_profile_context
+                user_profile = get_user_profile_context(user)
+        except Exception as e:
+            logger.error(f"Profile fetch failed for user {getattr(user, 'id', 'unknown')}: {e}")
+            user_profile = None
+        
         # Get session-specific engine for state isolation
         if session_id:
             try:
@@ -148,8 +133,12 @@ def chat(request):
             # No session, use global engine
             engine = get_engine()
         
-        # Process message
-        response = engine.process_message(user_message)
+        # Process message with user profile
+        response = engine.process_message(
+            message=user_message,
+            user_id=getattr(user, 'id', None),
+            user_profile=user_profile,
+        )
         
         # Optionally persist to database
         if session_id:
@@ -169,12 +158,12 @@ def chat(request):
                 logger.warning(f"ChatSession {session_id} not found")
         
         return Response(response, status=status.HTTP_200_OK)
-    
+
     except Exception as e:
-        logger.error(f"Error in chat endpoint: {e}", exc_info=True)
-        return Response(
-            {"error": str(e)},
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        logger.error(f"ChatView unhandled error: {e}")
+        return JsonResponse(
+            {"response": "I'm having trouble right now. Please try again in a moment."},
+            status=200
         )
 
 

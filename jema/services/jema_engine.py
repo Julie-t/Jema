@@ -8,6 +8,7 @@ import os
 import re
 import random
 import difflib
+import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -28,8 +29,7 @@ from jema.src.language_detector import LanguageDetector
 # Services imports
 from jema.services.llm_service import LLMService
 
-
-# Common African recipes fallback (when not in database) - diverse cuisines from across Africa
+logger = logging.getLogger(__name__)
 COMMON_RECIPES = {
     # East African
     "Beef Stew with Rice": {
@@ -503,75 +503,87 @@ class JemaEngine:
         # Return as newline-separated lines (Groq will see each as a step to title and number)
         return "\n".join(cleaned_sentences)
 
-    def process_message(self, user_input: str) -> Dict:
+    def process_message(
+        self,
+        message: str,
+        user_id: int = None,
+        user_profile: dict = None,
+        language: str = 'english'
+    ) -> str:
         """
         Process a user message and return a response.
-        
+
         Args:
-            user_input: User's natural language input
-        
+            message: User's natural language input
+            user_id: Optional user ID for logging
+            user_profile: Optional user profile dict from get_user_profile_context()
+            language: Detected language (default 'english')
+
         Returns:
-            Dictionary with:
-                - message: str (main response text)
-                - recipes: List[Dict] (suggested recipes if any)
-                - language: str (detected language)
-                - cta: str (call-to-action message)
-                - state: Dict (current conversation state for debugging)
+            Dictionary with response data
         """
-        user_input = user_input.strip()
-        
-        # Handle reset commands
-        if user_input.lower() in ["clear", "reset", "new conversation"]:
-            return self._reset_conversation()
-        
-        # Handle exit commands
-        if user_input.lower() in ["quit", "exit"]:
-            return self._build_response("Goodbye! Hope Jema was helpful!", [])
-        
-        # Detect language
-        self.llm.update_language(user_input)
-        
-        # Classify intent and constraints
-        intent, constraints, community, confidence = IntentClassifier.classify(user_input)
-        
-        # Route to handler based on intent
-        # Only route to community handler if NOT currently awaiting a recipe selection
-        # When awaiting_recipe_choice is True, the user is selecting a recipe — not requesting community recipes
-        if community and intent in [Intent.MEAL_IDEA, Intent.INFORMATION, Intent.CHAT_SOCIAL, Intent.RECIPE_REQUEST]:
-            if not (self.awaiting_recipe_choice and self.last_suggested_recipes):
-                return self._handle_community_request(user_input, community)
-        
-        if intent == Intent.GREETING:
-            return self._handle_greeting(user_input)
-        
-        if intent == Intent.REJECTION:
-            return self._handle_rejection(user_input)
-        
-        if intent == Intent.ACCOMPANIMENT:
-            return self._handle_accompaniment(user_input)
-        
-        if intent == Intent.FOLLOW_UP and len(self.llm.conversation_history) > 0:
-            return self._handle_follow_up(user_input)
-        
-        if self.awaiting_recipe_choice and self.last_suggested_recipes:
-            result = self._handle_recipe_selection(user_input)
-            if result:
-                return result
-        
-        if intent == Intent.MEAL_IDEA:
-            return self._handle_meal_idea(user_input)
-        
-        if intent in [Intent.INFORMATION, Intent.CHAT_SOCIAL]:
-            return self._handle_information(user_input)
-        
-        if intent == Intent.RECIPE_REQUEST:
-            return self._handle_recipe_request(user_input)
-        
-        if intent == Intent.INGREDIENT_BASED or intent == Intent.MEAL_IDEA:
-            return self._handle_ingredient_based(user_input, constraints)
-        
-        # Fallback
-        return self._handle_fallback(user_input)
+        try:
+            message = message.strip()
+            
+            # Store user_profile for use in recipe generation
+            self.user_profile = user_profile
+            
+            # Handle reset commands
+            if message.lower() in ["clear", "reset", "new conversation"]:
+                return self._reset_conversation()
+            
+            # Handle exit commands
+            if message.lower() in ["quit", "exit"]:
+                return self._build_response("Goodbye! Hope Jema was helpful!", [])
+            
+            # Detect language
+            self.llm.update_language(message)
+            
+            # Classify intent and constraints
+            intent, constraints, community, confidence = IntentClassifier.classify(message)
+            
+            # Route to handler based on intent
+            # Only route to community handler if NOT currently awaiting a recipe selection
+            # When awaiting_recipe_choice is True, the user is selecting a recipe — not requesting community recipes
+            if community and intent in [Intent.MEAL_IDEA, Intent.INFORMATION, Intent.CHAT_SOCIAL, Intent.RECIPE_REQUEST]:
+                if not (self.awaiting_recipe_choice and self.last_suggested_recipes):
+                    return self._handle_community_request(message, community)
+            
+            if intent == Intent.GREETING:
+                return self._handle_greeting(message)
+            
+            if intent == Intent.REJECTION:
+                return self._handle_rejection(message)
+            
+            if intent == Intent.ACCOMPANIMENT:
+                return self._handle_accompaniment(message)
+            
+            if intent == Intent.FOLLOW_UP and len(self.llm.conversation_history) > 0:
+                return self._handle_follow_up(message)
+            
+            if self.awaiting_recipe_choice and self.last_suggested_recipes:
+                result = self._handle_recipe_selection(message)
+                if result:
+                    return result
+            
+            if intent == Intent.MEAL_IDEA:
+                return self._handle_meal_idea(message)
+            
+            if intent in [Intent.INFORMATION, Intent.CHAT_SOCIAL]:
+                return self._handle_information(message)
+            
+            if intent == Intent.RECIPE_REQUEST:
+                return self._handle_recipe_request(message)
+            
+            if intent == Intent.INGREDIENT_BASED or intent == Intent.MEAL_IDEA:
+                return self._handle_ingredient_based(message, constraints)
+            
+            # Fallback
+            return self._handle_fallback(message)
+
+        except Exception as e:
+            logger.error(f"process_message failed: {e}")
+            return self._build_response("I'm sorry, I had trouble processing that. Could you try rephrasing your request?", [])
 
     def _reset_conversation(self) -> Dict:
         """Reset conversation state."""
@@ -1014,53 +1026,84 @@ class JemaEngine:
             return self._build_response(response, [])
 
     def _handle_ingredient_based(self, user_input: str, constraints: List) -> Dict:
-        """Handle ingredient-based recipe matching across African cuisines with deduplication."""
-        # Extract ingredients
-        user_ingredients = IngredientNormalizer.extract_from_string(user_input)
-        
-        if not user_ingredients:
-            response = self.llm.general_response(user_input, use_history=True, include_cta=False)
-            self.llm.add_to_history("user", user_input)
-            self.llm.add_to_history("assistant", response)
-            return self._build_response(response, [])
-        
-        # Remember ingredients
-        self.last_user_ingredients = set(user_ingredients)
-        
-        # Build constraints
-        user_constraints = {}
-        if Constraint.QUICK in constraints:
-            user_constraints['quick'] = True
-        
-        # Exclude beverages unless explicitly requested
-        beverage_terms = ['drink', 'beverage', 'juice', 'tea', 'coffee', 'soda', 'chai']
-        active_matcher = self.matcher
-        if not any(term in user_input.lower() for term in beverage_terms):
-            active_matcher = active_matcher.exclude_beverages()
-        
-        # STEP 0: Try direct CSV ingredient search first for primary ingredients
-        # This ensures recipes containing the requested ingredient are found directly
-        normalized_ingredients = [ing.lower().strip() for ing in user_ingredients]
-        raw_csv_results = []
-        
-        # Search each primary ingredient for direct matches
-        PRIMARY_INGREDIENTS = {
-            "eggs", "egg", "beef", "chicken", "kuku", "fish", "samaki",
-            "lamb", "goat", "pork", "meat", "nyama", "shrimp", "prawns",
-            "beans", "maharagwe", "lentils", "ndengu", "peas", "chickpeas",
-            "groundnuts", "groundnut", "peanut", "peanuts",
-            "rice", "mchele", "wali", "potato", "viazi", "maize", "mahindi",
-            "banana", "ndizi", "plantain", "cassava", "mihogo", "ugali",
-            "flour", "chapati", "spinach", "kale", "sukuma", "cabbage"
-        }
-        
-        # Try direct search for primary ingredients first
-        for ingredient in normalized_ingredients:
-            if ingredient in PRIMARY_INGREDIENTS:
-                direct_matches = self._csv_search_by_ingredient(ingredient, count=10)
-                for match in direct_matches:
-                    # Fetch full recipe row from CSV
-                    recipe_row = self.recipes_df[self.recipes_df['meal_name'] == match['meal_name']]
+        try:
+            # Extract ingredients
+            user_ingredients = IngredientNormalizer.extract_from_string(user_input)
+            
+            if not user_ingredients:
+                response = self.llm.general_response(user_input, use_history=True, include_cta=False)
+                self.llm.add_to_history("user", user_input)
+                self.llm.add_to_history("assistant", response)
+                return self._build_response(response, [])
+            
+            # Remember ingredients
+            self.last_user_ingredients = set(user_ingredients)
+            
+            # Build constraints
+            user_constraints = {}
+            if Constraint.QUICK in constraints:
+                user_constraints['quick'] = True
+            
+            # Exclude beverages unless explicitly requested
+            beverage_terms = ['drink', 'beverage', 'juice', 'tea', 'coffee', 'soda', 'chai']
+            active_matcher = self.matcher
+            if not any(term in user_input.lower() for term in beverage_terms):
+                active_matcher = active_matcher.exclude_beverages()
+            
+            # STEP 0: Try direct CSV ingredient search first for primary ingredients
+            # This ensures recipes containing the requested ingredient are found directly
+            normalized_ingredients = [ing.lower().strip() for ing in user_ingredients]
+            raw_csv_results = []
+            
+            # Search each primary ingredient for direct matches
+            PRIMARY_INGREDIENTS = {
+                "eggs", "egg", "beef", "chicken", "kuku", "fish", "samaki",
+                "lamb", "goat", "pork", "meat", "nyama", "shrimp", "prawns",
+                "beans", "maharagwe", "lentils", "ndengu", "peas", "chickpeas",
+                "groundnuts", "groundnut", "peanut", "peanuts",
+                "rice", "mchele", "wali", "potato", "viazi", "maize", "mahindi",
+                "banana", "ndizi", "plantain", "cassava", "mihogo", "ugali",
+                "flour", "chapati", "spinach", "kale", "sukuma", "cabbage"
+            }
+            
+            # Try direct search for primary ingredients first
+            for ingredient in normalized_ingredients:
+                if ingredient in PRIMARY_INGREDIENTS:
+                    direct_matches = self._csv_search_by_ingredient(ingredient, count=10)
+                    for match in direct_matches:
+                        # Fetch full recipe row from CSV
+                        recipe_row = self.recipes_df[self.recipes_df['meal_name'] == match['meal_name']]
+                        if not recipe_row.empty:
+                            row = recipe_row.iloc[0]
+                            full_recipe = {
+                                "meal_name": str(row.get("meal_name", "") if hasattr(row, 'get') else row["meal_name"]),
+                                "cuisine_region": str(row.get("cuisine_region", "") if hasattr(row, 'get') else row["cuisine_region"]),
+                                "core_ingredients": str(row.get("core_ingredients", "") if hasattr(row, 'get') else row["core_ingredients"]),
+                                "recipe": str(row.get("recipes", "") if hasattr(row, 'get') else row.get("recipes", "")),
+                                "cook_time_minutes": row.get("cook_time_minutes", 0) if hasattr(row, 'get') else 0,
+                                "notes": str(row.get("notes", "") if hasattr(row, 'get') else ""),
+                                "country": str(row.get("country", "") if hasattr(row, 'get') else ""),
+                            }
+                            # Only add if not already in results
+                            if not any(r['meal_name'] == full_recipe['meal_name'] for r in raw_csv_results):
+                                    raw_csv_results.append(full_recipe)
+            
+            # If direct search didn't find enough, fall back to matcher
+            if len(raw_csv_results) < 3:
+                # STEP 1: Get CSV results via matcher (fallback)
+                matches = active_matcher.match(
+                    user_ingredients=user_ingredients,
+                    user_constraints=user_constraints,
+                    min_match_percentage=0.4
+                )
+                
+                # Exclude rejected recipes
+                if self.rejected_recipes:
+                    matches = [m for m in matches if m.name not in self.rejected_recipes]
+                
+                # Get raw CSV results — convert to dicts immediately
+                for match in matches:
+                    recipe_row = self.recipes_df[self.recipes_df['meal_name'] == match.name]
                     if not recipe_row.empty:
                         row = recipe_row.iloc[0]
                         full_recipe = {
@@ -1075,243 +1118,198 @@ class JemaEngine:
                         # Only add if not already in results
                         if not any(r['meal_name'] == full_recipe['meal_name'] for r in raw_csv_results):
                             raw_csv_results.append(full_recipe)
-        
-        # If direct search didn't find enough, fall back to matcher
-        if len(raw_csv_results) < 3:
-            # STEP 1: Get CSV results via matcher (fallback)
-            matches = active_matcher.match(
-                user_ingredients=user_ingredients,
-                user_constraints=user_constraints,
-                min_match_percentage=0.4
-            )
             
-            # Exclude rejected recipes
-            if self.rejected_recipes:
-                matches = [m for m in matches if m.name not in self.rejected_recipes]
-            
-            # Get raw CSV results — convert to dicts immediately
-            for match in matches:
-                recipe_row = self.recipes_df[self.recipes_df['meal_name'] == match.name]
-                if not recipe_row.empty:
-                    row = recipe_row.iloc[0]
-                    full_recipe = {
-                        "meal_name": str(row.get("meal_name", "") if hasattr(row, 'get') else row["meal_name"]),
-                        "cuisine_region": str(row.get("cuisine_region", "") if hasattr(row, 'get') else row["cuisine_region"]),
-                        "core_ingredients": str(row.get("core_ingredients", "") if hasattr(row, 'get') else row["core_ingredients"]),
-                        "recipe": str(row.get("recipes", "") if hasattr(row, 'get') else row.get("recipes", "")),
-                        "cook_time_minutes": row.get("cook_time_minutes", 0) if hasattr(row, 'get') else 0,
-                        "notes": str(row.get("notes", "") if hasattr(row, 'get') else ""),
-                        "country": str(row.get("country", "") if hasattr(row, 'get') else ""),
-                    }
-                    # Only add if not already in results
-                    if not any(r['meal_name'] == full_recipe['meal_name'] for r in raw_csv_results):
-                        raw_csv_results.append(full_recipe)
-        
-        # ── STEP 1: Include all African recipes from CSV (no regional filtering) ──────────────────────────
-        # All African cuisines are welcome, so we use all results
-        ea_results = raw_csv_results
+            # ── STEP 1: Include all African recipes from CSV (no regional filtering) ──────────────────────────
+            # All African cuisines are welcome, so we use all results
+            ea_results = raw_csv_results
 
-        # ── STEP 2: Score CSV results by primary ingredient relevance ────────────────
-        # A recipe only qualifies if:
-        # (a) it contains the user's PRIMARY ingredient (eggs, beef, chicken, fish, beans, potato)
-        # (b) it matches at least 2 of the user's ingredients total
-        PRIMARY_INGREDIENTS = {
-            # Proteins
-            "eggs", "egg", "beef", "chicken", "kuku", "fish", "samaki",
-            "lamb", "goat", "pork", "meat", "nyama", "shrimp", "prawns",
-            # Legumes — these are primary ingredients, not supporting
-            "beans", "maharagwe", "lentils", "ndengu", "peas", "chickpeas",
-            "groundnuts", "groundnut", "peanut", "peanuts",
-            # Starches — primary when user mentions them
-            "rice", "mchele", "wali", "potato", "viazi", "maize", "mahindi",
-            "banana", "ndizi", "plantain", "cassava", "mihogo", "ugali",
-            "flour", "chapati",
-            # Vegetables that are primary when user specifically mentions them
-            "spinach", "kale", "sukuma", "cabbage"
-        }
+            # ── STEP 2: Score CSV results by primary ingredient relevance ────────────────
+            # A recipe only qualifies if:
+            # (a) it contains the user's PRIMARY ingredient (eggs, beef, chicken, fish, beans, potato)
+            # (b) it matches at least 2 of the user's ingredients total
+            PRIMARY_INGREDIENTS = {
+                # Proteins
+                "eggs", "egg", "beef", "chicken", "kuku", "fish", "samaki",
+                "lamb", "goat", "pork", "meat", "nyama", "shrimp", "prawns",
+                # Legumes — these are primary ingredients, not supporting
+                "beans", "maharagwe", "lentils", "ndengu", "peas", "chickpeas",
+                "groundnuts", "groundnut", "peanut", "peanuts",
+                # Starches — primary when user mentions them
+                "rice", "mchele", "wali", "potato", "viazi", "maize", "mahindi",
+                "banana", "ndizi", "plantain", "cassava", "mihogo", "ugali",
+                "flour", "chapati",
+                # Vegetables that are primary when user specifically mentions them
+                "spinach", "kale", "sukuma", "cabbage"
+            }
 
-        normalized_set = [ing.lower().strip() for ing in normalized_ingredients]
+            normalized_set = [ing.lower().strip() for ing in normalized_ingredients]
 
-        def count_primary_matches(recipe):
-            """
-            A recipe qualifies ONLY if ALL of the user's ingredients appear
-            in its core_ingredients field as whole words.
+            def count_primary_matches(recipe):
+                import re
+                core_ings = str(recipe.get("core_ingredients", "")).lower()
 
-            This ensures:
-            - rice + beef + onion → Biriani passes (has rice, meat/beef, onions)
-            - rice + beef + onion → Ndizi Nyama fails (has beef, onion but NO rice)
-            - rice + beef + onion → Sekela fails (has beef, onion but NO rice)
-            - rice + beef + onion → Wali wa Nazi fails (has rice, onion but NO beef)
-            """
-            import re
+                def exact_match(ingredient: str, text: str) -> bool:
+                    pattern = r'\b' + re.escape(ingredient) + r'\b'
+                    return bool(re.search(pattern, text))
 
-            # Use core_ingredients field only — not notes or substitutes
-            core_ings = str(recipe.get("core_ingredients", "")).lower()
-
-            def exact_match(ingredient: str, text: str) -> bool:
-                """Whole word match only — prevents partial matches."""
-                pattern = r'\b' + re.escape(ingredient) + r'\b'
-                return bool(re.search(pattern, text))
-
-            # Check each user ingredient
-            matched = [ing for ing in normalized_set if exact_match(ing, core_ings)]
-            missing = [ing for ing in normalized_set if not exact_match(ing, core_ings)]
-            match_count = len(matched)
-
-            # ALL user ingredients must be present
-            all_present = len(missing) == 0
-
-            # Primary ingredient must also be present
-            primary_matched = any(
-                exact_match(ing, core_ings)
-                for ing in normalized_set
-                if ing in PRIMARY_INGREDIENTS
-            )
-
-            return match_count, all_present and primary_matched
-
-        strong_csv = []
-        for r in ea_results:
-            match_count, all_ingredients_present = count_primary_matches(r)
-            if all_ingredients_present:
-                strong_csv.append((match_count, r))
-
-        # Sort by match count descending — most ingredient matches first
-        strong_csv.sort(key=lambda x: x[0], reverse=True)
-        csv_results = [recipe for _, recipe in strong_csv][:3]
-
-        # Build seen names from CSV results
-        seen_names = {
-            self._normalize_recipe_name(r.get("meal_name", ""))
-            for r in csv_results
-        }
-
-        # Determine how many slots Groq must fill
-        groq_needed = 3 - len(csv_results)
-        groq_recipes = []
-
-        if groq_needed > 0:
-            try:
-                groq_recipes = self.llm.generate_african_recipe_from_ingredients(
-                    user_ingredients=normalized_ingredients,
-                    exclude_names=list(seen_names),
-                    count=groq_needed,
-                    language=self.llm.current_language
+                matched = [ing for ing in normalized_set if exact_match(ing, core_ings)]
+                missing = [ing for ing in normalized_set if not exact_match(ing, core_ings)]
+                match_count = len(matched)
+                all_present = len(missing) == 0
+                primary_matched = any(
+                    exact_match(ing, core_ings)
+                    for ing in normalized_set
+                    if ing in PRIMARY_INGREDIENTS
                 )
-            except Exception as e:
-                print(f"Groq gap-fill error: {e}")
-                groq_recipes = []
 
-        # Merge CSV and Groq results without duplicates
-        all_recipes = list(csv_results)
-        for recipe in groq_recipes:
-            name_key = self._normalize_recipe_name(recipe.get("meal_name", ""))
-            if name_key and name_key not in seen_names:
-                all_recipes.append(recipe)
-                seen_names.add(name_key)
+                return match_count, all_present and primary_matched
 
-        # Final deduplication pass and cap at 3
-        final_recipes = []
-        final_names = set()
-        for recipe in all_recipes:
-            name_key = self._normalize_recipe_name(recipe.get("meal_name", ""))
-            if name_key and name_key not in final_names:
-                final_recipes.append(recipe)
-                final_names.add(name_key)
-        all_recipes = final_recipes[:3]
+            strong_csv = []
+            for r in ea_results:
+                match_count, all_ingredients_present = count_primary_matches(r)
+                if all_ingredients_present:
+                    strong_csv.append((match_count, r))
 
-        # If still fewer than 3 after merge, fill with defaults based on ingredients
-        if len(all_recipes) < 3:
-            existing_names = {self._normalize_recipe_name(r.get("meal_name", "")) for r in all_recipes}
-            normalized_set_lower = set(normalized_ingredients)
+            # Sort by match count descending — most ingredient matches first
+            strong_csv.sort(key=lambda x: x[0], reverse=True)
+            csv_results = [recipe for _, recipe in strong_csv][:3]
 
-            # Default fallback recipes mapped to common ingredient combinations
-            INGREDIENT_DEFAULTS = [
-                ({"rice", "beef", "onion"},    [
-                    {"meal_name": "Pilau",             "cuisine_region": "Kenya"},
-                    {"meal_name": "Biriani",            "cuisine_region": "Tanzania"},
-                    {"meal_name": "Rice and Beef Stew", "cuisine_region": "Kenya"},
-                ]),
-                ({"eggs", "onion"},            [
-                    {"meal_name": "Ugali Mayai",  "cuisine_region": "Kenya"},
-                    {"meal_name": "Rolex",        "cuisine_region": "Uganda"},
-                    {"meal_name": "Chapati Mayai","cuisine_region": "Kenya"},
-                ]),
-                ({"beans", "onion", "tomato"}, [
-                    {"meal_name": "Beans Stew",  "cuisine_region": "Kenya"},
-                    {"meal_name": "Githeri",     "cuisine_region": "Kenya"},
-                    {"meal_name": "Maharagwe",   "cuisine_region": "Tanzania"},
-                ]),
-                ({"chicken", "onion", "tomato"},[  
-                    {"meal_name": "Kuku Mchuzi",    "cuisine_region": "Kenya"},
-                    {"meal_name": "Kuku wa Kupaka", "cuisine_region": "Kenya"},
-                ]),
-                ({"potato", "onion"},          [
-                    {"meal_name": "Irio",       "cuisine_region": "Kenya"},
-                    {"meal_name": "Mukimo",     "cuisine_region": "Kenya"},
-                    {"meal_name": "Viazi Karai","cuisine_region": "Kenya"},
-                ]),
-                ({"lentils", "onion"},         [
-                    {"meal_name": "Ndengu",    "cuisine_region": "Kenya"},
-                    {"meal_name": "Misir Wot", "cuisine_region": "Ethiopia"},
-                ]),
-                ({"kale", "onion"},            [
-                    {"meal_name": "Sukuma Wiki","cuisine_region": "Kenya"},
-                    {"meal_name": "Githeri",   "cuisine_region": "Kenya"},
-                ]),
-            ]
+            # Build seen names from CSV results
+            seen_names = {
+                self._normalize_recipe_name(r.get("meal_name", ""))
+                for r in csv_results
+            }
 
-            for ingredient_set, defaults in INGREDIENT_DEFAULTS:
-                if ingredient_set.issubset(normalized_set_lower):
-                    for default in defaults:
-                        name_key = self._normalize_recipe_name(default["meal_name"])
-                        if name_key not in existing_names and len(all_recipes) < 3:
-                            all_recipes.append(default)
-                            existing_names.add(name_key)
-                    break
+            # Determine how many slots Groq must fill
+            groq_needed = 3 - len(csv_results)
+            groq_recipes = []
 
-        # Apply regional diversity to final recipe selection
-        # This ensures we don't repeat recipes from the same region
-        if len(all_recipes) >= 3:
-            all_recipes = self._select_diverse_recipes(all_recipes, num_to_select=3, prefer_new_regions=True)
-        else:
-            # Track regions even if we have fewer than 3 recipes
+            if groq_needed > 0:
+                try:
+                    groq_recipes = self.llm.generate_african_recipe_from_ingredients(
+                        user_ingredients=normalized_ingredients,
+                        exclude_names=list(seen_names),
+                        count=groq_needed,
+                        language=self.llm.current_language
+                    )
+                except Exception as e:
+                    print(f"Groq gap-fill error: {e}")
+                    groq_recipes = []
+
+            # Merge CSV and Groq results without duplicates
+            all_recipes = list(csv_results)
+            for recipe in groq_recipes:
+                name_key = self._normalize_recipe_name(recipe.get("meal_name", ""))
+                if name_key and name_key not in seen_names:
+                    all_recipes.append(recipe)
+                    seen_names.add(name_key)
+
+            # Final deduplication pass and cap at 3
+            final_recipes = []
+            final_names = set()
             for recipe in all_recipes:
-                region = self._get_recipe_region(recipe)
-                if region:
-                    self.suggested_regions.append(region)
+                name_key = self._normalize_recipe_name(recipe.get("meal_name", ""))
+                if name_key and name_key not in final_names:
+                    final_recipes.append(recipe)
+                    final_names.add(name_key)
+            all_recipes = final_recipes[:3]
 
-        # Store full recipes in session state
-        self.last_suggested_recipes = all_recipes
-        self.awaiting_recipe_choice = True
+            # If still fewer than 3 after merge, fill with defaults based on ingredients
+            if len(all_recipes) < 3:
+                existing_names = {self._normalize_recipe_name(r.get("meal_name", "")) for r in all_recipes}
+                normalized_set_lower = set(normalized_ingredients)
 
-        # Accuracy debug
-        self._debug_groq_accuracy(
-            user_ingredients=normalized_ingredients,
-            suggested_recipes=all_recipes,
-            source="groq+csv"
-        )
+                # Default fallback recipes mapped to common ingredient combinations
+                INGREDIENT_DEFAULTS = [
+                    ({"rice", "beef", "onion"},    [
+                        {"meal_name": "Pilau",             "cuisine_region": "Kenya"},
+                        {"meal_name": "Biriani",            "cuisine_region": "Tanzania"},
+                        {"meal_name": "Rice and Beef Stew", "cuisine_region": "Kenya"},
+                    ]),
+                    ({"eggs", "onion"},            [
+                        {"meal_name": "Ugali Mayai",  "cuisine_region": "Kenya"},
+                        {"meal_name": "Rolex",        "cuisine_region": "Uganda"},
+                        {"meal_name": "Chapati Mayai","cuisine_region": "Kenya"},
+                    ]),
+                    ({"beans", "onion", "tomato"}, [
+                        {"meal_name": "Beans Stew",  "cuisine_region": "Kenya"},
+                        {"meal_name": "Githeri",     "cuisine_region": "Kenya"},
+                        {"meal_name": "Maharagwe",   "cuisine_region": "Tanzania"},
+                    ]),
+                    ({"chicken", "onion", "tomato"},[  
+                        {"meal_name": "Kuku Mchuzi",    "cuisine_region": "Kenya"},
+                        {"meal_name": "Kuku wa Kupaka", "cuisine_region": "Kenya"},
+                    ]),
+                    ({"potato", "onion"},          [
+                        {"meal_name": "Irio",       "cuisine_region": "Kenya"},
+                        {"meal_name": "Mukimo",     "cuisine_region": "Kenya"},
+                        {"meal_name": "Viazi Karai","cuisine_region": "Kenya"},
+                    ]),
+                    ({"lentils", "onion"},         [
+                        {"meal_name": "Ndengu",    "cuisine_region": "Kenya"},
+                        {"meal_name": "Misir Wot", "cuisine_region": "Ethiopia"},
+                    ]),
+                    ({"kale", "onion"},            [
+                        {"meal_name": "Sukuma Wiki","cuisine_region": "Kenya"},
+                        {"meal_name": "Githeri",   "cuisine_region": "Kenya"},
+                    ]),
+                ]
 
-        # Format suggestion list
-        if self.llm.current_language == "sw":
-            output = "\nUnaweza kupika mojawapo ya vyakula hivi:\n\n"
-        else:
-            output = "\nHey there, you could try one of the following:\n\n"
+                for ingredient_set, defaults in INGREDIENT_DEFAULTS:
+                    if ingredient_set.issubset(normalized_set_lower):
+                        for default in defaults:
+                            name_key = self._normalize_recipe_name(default["meal_name"])
+                            if name_key not in existing_names and len(all_recipes) < 3:
+                                all_recipes.append(default)
+                                existing_names.add(name_key)
+                        break
 
-        for i, recipe in enumerate(all_recipes, 1):
-            meal_name = recipe.get("meal_name", "")
-            cuisine = recipe.get("cuisine_region", "")
-            output += f"{i}. {meal_name} – {cuisine}\n"
+            # Apply regional diversity to final recipe selection
+            # This ensures we don't repeat recipes from the same region
+            if len(all_recipes) >= 3:
+                all_recipes = self._select_diverse_recipes(all_recipes, num_to_select=3, prefer_new_regions=True)
+            else:
+                # Track regions even if we have fewer than 3 recipes
+                for recipe in all_recipes:
+                    region = self._get_recipe_region(recipe)
+                    if region:
+                        self.suggested_regions.append(region)
 
-        if self.llm.current_language == "sw":
-            output += "\nUngependa kuweka ipi?\n"
-        else:
-            output += "\nWhich one would you like?\n"
+            # Store full recipes in session state
+            self.last_suggested_recipes = all_recipes
+            self.awaiting_recipe_choice = True
 
-        self.llm.add_to_history("user", user_input)
-        self.llm.add_to_history("assistant", output)
+            # Accuracy debug
+            self._debug_groq_accuracy(
+                user_ingredients=normalized_ingredients,
+                suggested_recipes=all_recipes,
+                source="groq+csv"
+            )
 
-        return self._build_response(output, all_recipes)
+            # Format suggestion list
+            if self.llm.current_language == "sw":
+                output = "\nUnaweza kupika mojawapo ya vyakula hivi:\n\n"
+            else:
+                output = "\nHey there, you could try one of the following:\n\n"
+
+            for i, recipe in enumerate(all_recipes, 1):
+                meal_name = recipe.get("meal_name", "")
+                cuisine = recipe.get("cuisine_region", "")
+                output += f"{i}. {meal_name} – {cuisine}\n"
+
+            if self.llm.current_language == "sw":
+                output += "\nUngependa kuweka ipi?\n"
+            else:
+                output += "\nWhich one would you like?\n"
+
+            self.llm.add_to_history("user", user_input)
+            self.llm.add_to_history("assistant", output)
+
+            return self._build_response(output, all_recipes)
+
+        except Exception as e:
+            logger.error(f"_handle_ingredient_based failed: {e}")
+            return self._build_response("I had trouble finding recipes for those ingredients. Could you try again?", [])
 
     def _handle_no_matches(self, user_ingredients: set, matcher, user_constraints: Dict, user_input: str) -> Dict:
         """Handle when no recipes match user ingredients."""
@@ -1477,7 +1475,7 @@ class JemaEngine:
         else:
             # Try to generate a rich recipe using the new generate_recipe method for CSV recipes
             if self.llm.client is not None:
-                rich_recipe = self.llm.generate_recipe(recipe_name, country)
+                rich_recipe = self.llm.generate_recipe(recipe_name, country, user_profile=self.user_profile)
                 if rich_recipe:
                     # generate_recipe() now returns a fully formatted string
                     message = rich_recipe
